@@ -27,6 +27,8 @@ from config import (
 )
 from dataset import TurnDataset, collate_fn, get_weighted_sampler, get_balanced_sampler
 from td_head import TDHead
+from td_head_mlp import TDHeadMLP
+from td_head_qwen import QwenClassifierHead
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -87,11 +89,14 @@ def log_metrics(logger, prefix, metrics):
 
 
 class UAFModel(torch.nn.Module):
-    def __init__(self, model_path, training_stage="A", use_lora=False, lora_rank=8, lora_alpha=16):
+    def __init__(self, model_path, training_stage="A", use_lora=False, lora_rank=8, lora_alpha=16, td_head_type="attention", ffn_type="moe", num_td_layers=1):
         super().__init__()
 
         self.training_stage = training_stage
         self.use_lora = use_lora
+        self.td_head_type = td_head_type
+        self.ffn_type = ffn_type
+        self.num_td_layers = num_td_layers
 
         logger.info("=" * 60)
         logger.info("Initializing UAF Model with QLoRA")
@@ -159,7 +164,15 @@ class UAFModel(torch.nn.Module):
         # ========== 4. 添加 TD Head ==========
         logger.info("Step 4: Adding TD Head ...")
         hidden_size = self.base_model.config.thinker_config.text_config.hidden_size
-        self.td_head = TDHead(hidden_size=hidden_size, num_labels=4)
+        if td_head_type == "mlp":
+            logger.info("   Using MLP TD Head (2-layer)")
+            self.td_head = TDHeadMLP(hidden_size=hidden_size, num_labels=4)
+        elif td_head_type == "qwen":
+            logger.info(f"   Using Qwen-Style GQA Classifier Head (ffn={ffn_type})")
+            self.td_head = QwenClassifierHead(hidden_size=hidden_size, num_labels=4, ffn_type=ffn_type, num_layers=num_td_layers)
+        else:
+            logger.info("   Using Attention Pooling TD Head")
+            self.td_head = TDHead(hidden_size=hidden_size, num_labels=4)
 
         td_params = sum(p.numel() for p in self.td_head.parameters())
         logger.info(f"   TD Head params: {td_params:,}")
@@ -173,7 +186,9 @@ class UAFModel(torch.nn.Module):
         logger.info("✅ UAF Model initialized successfully")
         logger.info(f"   Training stage: {training_stage}")
         logger.info(f"   LoRA: {'enabled' if use_lora else 'disabled'}")
-        logger.info(f"   TD Head: enabled")
+        logger.info(f"   TD Head: {td_head_type}")
+        if td_head_type == "qwen":
+            logger.info(f"   FFN type: {ffn_type}")
         logger.info("=" * 60)
 
     def _load_audio(self, wav_path):
@@ -385,6 +400,14 @@ def evaluate_on_testset(model, eval_list_file, evalset_dir, max_audio_seconds, b
 
 
 def train(args):
+    # 处理类别权重
+    if args.class_weights:
+        global CLASS_WEIGHTS
+        CLASS_WEIGHTS = args.class_weights
+        logger.info(f"Using custom class weights: {CLASS_WEIGHTS}")
+    else:
+        logger.info(f"Using default class weights: {CLASS_WEIGHTS}")
+
     # 初始化模型
     model = UAFModel(
         model_path=args.model_path,
@@ -392,6 +415,9 @@ def train(args):
         use_lora=args.use_lora,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
+        td_head_type=args.td_head_type,
+        ffn_type=args.ffn_type,
+        num_td_layers=args.num_td_layers,
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -430,8 +456,9 @@ def train(args):
         batch_size=args.per_device_train_batch_size,
         shuffle=shuffle,
         sampler=sampler,
-        num_workers=2,
+        num_workers=args.num_workers,
         collate_fn=collate_fn,
+        pin_memory=True,
     )
 
     # 参数组配置
@@ -595,7 +622,12 @@ def train(args):
                         if args.deepspeed:
                             model_engine.save_checkpoint(save_path)
                         else:
+                            # 保存 TD Head 权重
                             torch.save(model_engine.td_head.state_dict(), os.path.join(save_path, "td_head.pt"))
+                            # 保存 LoRA 权重
+                            if args.use_lora:
+                                model_engine.base_model.save_pretrained(save_path)
+                                logger.info(f"Saved LoRA adapter to {save_path}")
                         logger.info(f"Saved checkpoint to {save_path}")
 
                 # Testset 评估
@@ -622,7 +654,11 @@ def train(args):
                             if args.deepspeed:
                                 model_engine.save_checkpoint(best_path)
                             else:
+                                # 保存 TD Head 权重
                                 torch.save(model_engine.td_head.state_dict(), os.path.join(best_path, "td_head.pt"))
+                                # 保存 LoRA 权重
+                                if args.use_lora:
+                                    model_engine.base_model.save_pretrained(best_path)
                             best_checkpoint_path = best_path
                             logger.info(f"🎯 New best Testset Macro-F1: {test_f1:.4f} -> Saved to {best_path}")
                         else:
@@ -644,7 +680,12 @@ def train(args):
     if args.deepspeed:
         model_engine.save_checkpoint(final_path)
     else:
+        # 保存 TD Head 权重
         torch.save(model_engine.td_head.state_dict(), os.path.join(final_path, "td_head.pt"))
+        # 保存 LoRA 权重
+        if args.use_lora:
+            model_engine.base_model.save_pretrained(final_path)
+            logger.info(f"Saved final LoRA adapter to {final_path}")
 
     # 最终评估
     if args.eval_list_file:
@@ -665,6 +706,129 @@ def train(args):
     logger.info(f"   Final model: {final_path}")
     logger.info(f"{'='*60}")
 
+    # ========== 自动保存训练配置和结果 ==========
+    import json
+    import sys
+    from datetime import datetime
+
+    # 1. 保存训练参数配置
+    train_config = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "model_path": args.model_path,
+        "output_dir": args.output_dir,
+        "train_list_file": args.train_list_file,
+        "trainset_dir": args.trainset_dir,
+        "eval_list_file": args.eval_list_file,
+        "evalset_dir": args.evalset_dir,
+        "sampler": args.sampler,
+        "stage": args.stage,
+        "td_head_type": args.td_head_type,
+        "ffn_type": args.ffn_type,
+        "use_lora": args.use_lora,
+        "lora_rank": args.lora_rank,
+        "lora_alpha": args.lora_alpha,
+        "num_train_epochs": args.num_train_epochs,
+        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "per_device_eval_batch_size": args.per_device_eval_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "max_audio_seconds": args.max_audio_seconds,
+        "lr_td_head": args.lr_td_head,
+        "lr_lora": args.lr_lora,
+        "logging_steps": args.logging_steps,
+        "eval_steps": args.eval_steps,
+        "save_steps": args.save_steps,
+        "early_stopping_patience": args.early_stopping_patience,
+        "num_workers": args.num_workers,
+        "load_td_head": args.load_td_head,
+    }
+
+    config_path = os.path.join(args.output_dir, "training_config.json")
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(train_config, f, indent=2, ensure_ascii=False)
+    logger.info(f"Saved training config to {config_path}")
+
+    # 2. 保存启动命令
+    lora_line = "--use_lora \\\n    " if args.use_lora else ""
+    load_td_line = f"--load_td_head {args.load_td_head}" if args.load_td_head else ""
+    run_command = f"""#!/bin/bash
+# 自动生成的启动脚本
+# 训练时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+cd {os.getcwd()}
+
+python train/train.py \\
+    --model_path {args.model_path} \\
+    --output_dir {args.output_dir} \\
+    --train_list_file {args.train_list_file} \\
+    --trainset_dir {args.trainset_dir} \\
+    --eval_list_file {args.eval_list_file} \\
+    --evalset_dir {args.evalset_dir} \\
+    --sampler {args.sampler} \\
+    --stage {args.stage} \\
+    --td_head_type {args.td_head_type} \\
+    --ffn_type {args.ffn_type} \\
+    --num_td_layers {args.num_td_layers} \\
+    {lora_line}--lora_rank {args.lora_rank} \\
+    --lora_alpha {args.lora_alpha} \\
+    --num_train_epochs {args.num_train_epochs} \\
+    --per_device_train_batch_size {args.per_device_train_batch_size} \\
+    --gradient_accumulation_steps {args.gradient_accumulation_steps} \\
+    --max_audio_seconds {args.max_audio_seconds} \\
+    --lr_td_head {args.lr_td_head} \\
+    --lr_lora {args.lr_lora} \\
+    --logging_steps {args.logging_steps} \\
+    --eval_steps {args.eval_steps} \\
+    --save_steps {args.save_steps} \\
+    --early_stopping_patience {args.early_stopping_patience} \\
+    --num_workers {args.num_workers} \\
+    {load_td_line}
+"""
+
+    run_cmd_path = os.path.join(args.output_dir, "run_train.sh")
+    with open(run_cmd_path, "w", encoding="utf-8") as f:
+        f.write(run_command)
+    os.chmod(run_cmd_path, 0o755)
+    logger.info(f"Saved run command to {run_cmd_path}")
+
+    # 3. 保存最优结果摘要
+    results_summary = f"""
+{'='*60}
+训练结果摘要
+{'='*60}
+训练时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+模型路径: {args.model_path}
+训练阶段: Stage {args.stage}
+TD Head: {args.td_head_type} (ffn={args.ffn_type})
+LoRA: {'启用' if args.use_lora else '禁用'} (rank={args.lora_rank}, alpha={args.lora_alpha})
+加载权重: {args.load_td_head or '无'}
+
+{'='*60}
+最优结果
+{'='*60}
+Best Testset Macro-F1: {best_metric:.4f}
+Best Checkpoint: {best_checkpoint_path or '无'}
+
+{'='*60}
+最终模型
+{'='*60}
+Final Model: {final_path}
+Final Accuracy: {final_metrics['acc']:.4f}
+Final Macro-F1: {final_metrics['macro_f1']:.4f}
+
+各类别详细指标:
+  Complete:     Acc={final_metrics['per_class_acc'][0]:.4f} | P={final_metrics['per_class_precision'][0]:.4f} | R={final_metrics['per_class_recall'][0]:.4f} | F1={final_metrics['per_class_f1'][0]:.4f}
+  InComplete:   Acc={final_metrics['per_class_acc'][1]:.4f} | P={final_metrics['per_class_precision'][1]:.4f} | R={final_metrics['per_class_recall'][1]:.4f} | F1={final_metrics['per_class_f1'][1]:.4f}
+  Backchannel:  Acc={final_metrics['per_class_acc'][2]:.4f} | P={final_metrics['per_class_precision'][2]:.4f} | R={final_metrics['per_class_recall'][2]:.4f} | F1={final_metrics['per_class_f1'][2]:.4f}
+  Wait:         Acc={final_metrics['per_class_acc'][3]:.4f} | P={final_metrics['per_class_precision'][3]:.4f} | R={final_metrics['per_class_recall'][3]:.4f} | F1={final_metrics['per_class_f1'][3]:.4f}
+
+{'='*60}
+"""
+
+    results_path = os.path.join(args.output_dir, "results.txt")
+    with open(results_path, "w", encoding="utf-8") as f:
+        f.write(results_summary)
+    logger.info(f"Saved results summary to {results_path}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="UAF Turn Head Training")
@@ -678,6 +842,12 @@ def main():
     parser.add_argument("--sampler", type=str, default="weighted",
                         choices=["none", "weighted", "balanced"])
     parser.add_argument("--stage", type=str, default="A", choices=["A", "B", "C"])
+    parser.add_argument("--td_head_type", type=str, default="attention", choices=["attention", "mlp", "qwen"],
+                        help="TD Head type: attention (AttentionPooling), mlp (2-layer MLP), or qwen (GQA+FFN Decoder)")
+    parser.add_argument("--ffn_type", type=str, default="moe", choices=["moe", "dense"],
+                        help="FFN type for qwen head: moe (128 experts, top-8) or dense (SwiGLU 6144)")
+    parser.add_argument("--num_td_layers", type=int, default=1,
+                        help="Number of decoder layers in qwen classifier head")
     parser.add_argument("--use_lora", action="store_true")
     parser.add_argument("--lora_rank", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
@@ -693,6 +863,8 @@ def main():
     parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--deepspeed", type=str, default=None,
                         help="DeepSpeed config file path")
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="Number of data loading workers")
 
     # 学习率参数
     parser.add_argument("--lr_td_head", type=float, default=5e-4)
@@ -702,6 +874,10 @@ def main():
     # 加载第一阶段权重
     parser.add_argument("--load_td_head", type=str, default=None,
                         help="Path to stage_a td_head.pt to load")
+
+    # 类别权重
+    parser.add_argument("--class_weights", type=float, nargs=4, default=None,
+                        help="Class weights for loss function: [Complete, InComplete, Backchannel, Wait]")
 
     args = parser.parse_args()
     train(args)

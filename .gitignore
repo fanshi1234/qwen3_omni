@@ -32,3 +32,5 @@ train/output_*/
 # 临时文件
 =0.46.1
 .gradio/
+wget-log
+xiazai.txt

@@ -1,7 +1,6 @@
 #!/bin/bash
-# 阶段 B: TD Head + QLoRA
-# 8×3090 (24GB) 配置 - 高显存利用版
-# 加载第一阶段最优 TD Head 权重
+# 阶段 B: TD Head (MLP) + QLoRA
+# 8×3090 (24GB) 配置
 
 set -e
 cd /data2/wgy/qwen
@@ -9,10 +8,11 @@ cd /data2/wgy/qwen
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 echo "=========================================="
-echo "阶段 B: TD Head + QLoRA (高显存版)"
+echo "阶段 B: TD Head (MLP) + QLoRA"
 echo "=========================================="
-echo "加载第一阶段最优权重: ./train/output_stage_a/best_checkpoint/td_head.pt"
+echo "加载第一阶段最优权重: ./train/output_stage_a_mlp/best_checkpoint/td_head.pt"
 echo "Batch size: 8, 梯度累积: 16, 最大音频: 20秒"
+echo "输出目录: ./train/output_stage_b_mlp"
 echo "=========================================="
 
 # 清理 GPU 显存
@@ -21,13 +21,14 @@ sleep 3
 
 python train/train.py \
     --model_path ./Qwen3-Omni-30B-A3B-Instruct \
-    --output_dir ./train/output_stage_b \
+    --output_dir ./train/output_stage_b_mlp \
     --train_list_file ./dataset/Easy-Turn/Trainset_list/merged_balanced.list \
     --trainset_dir ./dataset/Easy-Turn/Trainset \
     --eval_list_file ./dataset/Easy-Turn/Testset/testset_all.list \
     --evalset_dir ./dataset/Easy-Turn/Testset \
     --sampler weighted \
     --stage B \
+    --td_head_type mlp \
     --use_lora \
     --lora_rank 16 \
     --lora_alpha 32 \
@@ -41,11 +42,11 @@ python train/train.py \
     --eval_steps 200 \
     --save_steps 500 \
     --early_stopping_patience 10 \
-    --load_td_head ./train/output_stage_a/best_checkpoint/td_head.pt \
-    --num_workers 4 \
-    2>&1 | tee ./train/output_stage_b/train.log
+    --num_workers 32 \
+    --load_td_head ./train/output_stage_a_mlp/best_checkpoint/td_head.pt \
+    2>&1 | tee ./train/output_stage_b_mlp/train.log
 
 echo ""
-echo "✅ 阶段 B 训练完成"
-echo "📁 模型: ./train/output_stage_b/"
-echo "📊 日志: ./train/output_stage_b/train.log"
+echo "✅ 阶段 B (MLP) 训练完成"
+echo "📁 模型: ./train/output_stage_b_mlp/"
+echo "📊 日志: ./train/output_stage_b_mlp/train.log"
