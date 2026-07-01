@@ -223,9 +223,55 @@ FFN(x) = down_proj(silu(gate_proj(x)) * up_proj(x))
 
 ---
 
-## 5. 当前实验结果
+## 5. Token TD Head (新)
+
+**配置**: `--td_head_type token`
+**参数量**: ~8K
+
+### 架构
+
+与原始 LM Head 完全一致，只是输出维度从 152064 改为 4。
+
+```
+Thinker hidden_states [B, T, 2048]
+        ↓
+token_class_head = Linear(2048, 4, bias=False)
+        ↓
+class_logits [B, T, 4]
+        ↓
+取最后有效位置 logits [B, 4]
+        ↓
+CE Loss
+```
+
+### 特点
+
+- 使用所有 hidden states，不只提取 audio 部分
+- 与原始 LM Head 结构完全一致
+- 用原始 lm_head 中对应词的行向量初始化
+
+### 初始化
+
+```python
+# 找到标签对应的 token id
+token_ids = {
+    0: tokenizer.encode("<COMPLETE>")[0],
+    1: tokenizer.encode("<INCOMPLETE>")[0],
+    2: tokenizer.encode("<BACKCHANNEL>")[0],
+    3: tokenizer.encode("<WAIT>")[0],
+}
+
+# 用 lm_head 中对应行的向量初始化
+for label_id, token_id in token_ids.items():
+    token_class_head.weight[label_id] = lm_head.weight[token_id]
+```
+
+---
+
+## 6. 当前实验结果
 
 | 模型 | 参数量 | Best Macro-F1 | 状态 |
 |------|--------|--------------|------|
 | Dense SwiGLU | ~56M | **0.4619** | ✅ 完成 |
-| MoE | ~623M | 待定 | 🔄 训练中 (F1=0.4299 @ step 400) |
+| MoE | ~623M | 待定 | 🔄 训练中 |
+| Token | ~8K | 待定 | 待运行 |

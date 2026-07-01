@@ -29,6 +29,8 @@ from dataset import TurnDataset, collate_fn, get_weighted_sampler, get_balanced_
 from td_head import TDHead
 from td_head_mlp import TDHeadMLP
 from td_head_qwen import QwenClassifierHead
+from td_head_lm import TDHeadLM, DualLMHead
+from td_head_token import TDHeadToken
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -89,7 +91,9 @@ def log_metrics(logger, prefix, metrics):
 
 
 class UAFModel(torch.nn.Module):
-    def __init__(self, model_path, training_stage="A", use_lora=False, lora_rank=8, lora_alpha=16, td_head_type="attention", ffn_type="moe", num_td_layers=1):
+    def __init__(self, model_path, training_stage="A", use_lora=False, lora_rank=8, lora_alpha=16,
+                 td_head_type="attention", ffn_type="moe", num_td_layers=1,
+                 init_strategy="column", init_scale=0.2):
         super().__init__()
 
         self.training_stage = training_stage
@@ -97,6 +101,8 @@ class UAFModel(torch.nn.Module):
         self.td_head_type = td_head_type
         self.ffn_type = ffn_type
         self.num_td_layers = num_td_layers
+        self.init_strategy = init_strategy
+        self.init_scale = init_scale
 
         logger.info("=" * 60)
         logger.info("Initializing UAF Model with QLoRA")
@@ -161,8 +167,12 @@ class UAFModel(torch.nn.Module):
         else:
             logger.info("Step 3: Skipping LoRA (Stage A - only TD Head)")
 
-        # ========== 4. 添加 TD Head ==========
-        logger.info("Step 4: Adding TD Head ...")
+        # ========== 4. 加载 Processor ==========
+        logger.info("Step 4: Loading processor ...")
+        self.processor = Qwen3OmniMoeProcessor.from_pretrained(model_path)
+
+        # ========== 5. 添加 TD Head ==========
+        logger.info("Step 5: Adding TD Head ...")
         hidden_size = self.base_model.config.thinker_config.text_config.hidden_size
         if td_head_type == "mlp":
             logger.info("   Using MLP TD Head (2-layer)")
@@ -170,16 +180,35 @@ class UAFModel(torch.nn.Module):
         elif td_head_type == "qwen":
             logger.info(f"   Using Qwen-Style GQA Classifier Head (ffn={ffn_type})")
             self.td_head = QwenClassifierHead(hidden_size=hidden_size, num_labels=4, ffn_type=ffn_type, num_layers=num_td_layers)
+        elif td_head_type == "lm_head":
+            logger.info("   Using LM Head based TD Head (pretrained weight initialization)")
+            # 创建 TD Head
+            self.td_head = TDHeadLM(hidden_size=hidden_size, num_labels=4, pooling_type="attention")
+            # 从预训练 LM Head 加载权重
+            lm_head_weight = self.base_model.thinker.lm_head.weight.data.clone()
+            self.td_head.load_pretrained_lm_head(lm_head_weight)
+            logger.info("   Loaded pretrained LM Head weights for initialization")
+        elif td_head_type == "token":
+            logger.info(f"   Using Token TD Head (same as LM Head, output_dim=4)")
+            logger.info(f"   Init strategy: {init_strategy}")
+            logger.info(f"   Init scale: {init_scale}")
+            # 创建 TD Head
+            self.td_head = TDHeadToken(hidden_size=hidden_size, num_labels=4)
+            # 从预训练 LM Head 加载权重
+            lm_head_weight = self.base_model.thinker.lm_head.weight.data.clone()
+            self.td_head.load_pretrained_weights(
+                lm_head_weight,
+                self.processor.tokenizer,
+                init_strategy=init_strategy,
+                init_scale=init_scale,
+            )
+            logger.info("   Loaded pretrained LM Head weights for initialization")
         else:
             logger.info("   Using Attention Pooling TD Head")
             self.td_head = TDHead(hidden_size=hidden_size, num_labels=4)
 
         td_params = sum(p.numel() for p in self.td_head.parameters())
         logger.info(f"   TD Head params: {td_params:,}")
-
-        # ========== 5. 加载 Processor ==========
-        logger.info("Step 5: Loading processor ...")
-        self.processor = Qwen3OmniMoeProcessor.from_pretrained(model_path)
 
         # ========== 完成 ==========
         logger.info("=" * 60)
@@ -189,6 +218,9 @@ class UAFModel(torch.nn.Module):
         logger.info(f"   TD Head: {td_head_type}")
         if td_head_type == "qwen":
             logger.info(f"   FFN type: {ffn_type}")
+        if td_head_type == "lm_head":
+            logger.info(f"   Pooling type: attention")
+            logger.info(f"   Init: pretrained LM Head weights")
         logger.info("=" * 60)
 
     def _load_audio(self, wav_path):
@@ -335,7 +367,17 @@ class UAFModel(torch.nn.Module):
             padded_amask[i, :A] = audio_masks[i]
 
         # TD Head
-        turn_logits = self.td_head(padded_audio, padded_amask)
+        # 确保 td_head 在正确的设备上
+        td_head_device = hidden_states.device
+        if next(self.td_head.parameters()).device != td_head_device:
+            self.td_head = self.td_head.to(td_head_device)
+
+        if self.td_head_type == "token":
+            # Token 类型: 使用所有 hidden states 和完整 attention_mask
+            turn_logits = self.td_head(hidden_states, inputs["attention_mask"].to(td_head_device))
+        else:
+            # 其他类型: 只使用 audio hidden states
+            turn_logits = self.td_head(padded_audio, padded_amask)
 
         result = {"turn_logits": turn_logits}
 
@@ -418,6 +460,8 @@ def train(args):
         td_head_type=args.td_head_type,
         ffn_type=args.ffn_type,
         num_td_layers=args.num_td_layers,
+        init_strategy=args.init_strategy,
+        init_scale=args.init_scale,
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -505,13 +549,35 @@ def train(args):
 
     # 优化器配置
     # NF4 量化模型 + DeepSpeed 有兼容性问题，使用普通优化器
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters)
+    # 使用 SGD 优化器避免 AdamW 导致的 NaN 问题
+    optimizer = torch.optim.SGD(optimizer_grouped_parameters, momentum=0.9)
     model_engine = model
-    logger.info("Using standard optimizer (NF4 + DeepSpeed not compatible)")
+    logger.info("Using SGD optimizer (momentum=0.9)")
+
+    # 学习率调度器：线性预热 + 余弦退火
+    total_steps = len(train_loader) * args.num_train_epochs // args.gradient_accumulation_steps
+    warmup_steps = max(1, int(total_steps * 0.01))  # 1% 预热
+
+    from torch.optim.lr_scheduler import LambdaLR
+    import math
+
+    def lr_lambda(current_step):
+        """线性预热 + 余弦退火"""
+        if current_step < warmup_steps:
+            # 线性预热
+            return float(current_step) / float(max(1, warmup_steps))
+        else:
+            # 余弦退火
+            progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    scheduler = LambdaLR(optimizer, lr_lambda)
+    logger.info(f"Learning rate scheduler: linear warmup ({warmup_steps} steps) + cosine annealing")
 
     # 早停配置
     early_stopping_patience = args.early_stopping_patience
     best_metric = 0.0
+    best_metrics = None  # 保存最优模型的详细指标
     patience_counter = 0
     best_checkpoint_path = None
 
@@ -570,6 +636,33 @@ def train(args):
 
             loss = outputs["loss"]
 
+            # 调试信息 - 前 10 个 step
+            if batch_idx < 10:
+                logger.info(f"\n--- Debug Step {batch_idx} (accum: {(batch_idx + 1) % args.gradient_accumulation_steps}) ---")
+                # 检查 hidden_states
+                if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
+                    hs = outputs.hidden_states
+                    logger.info(f"  hidden_states: mean={hs.mean():.6f}, std={hs.std():.6f}, max={hs.abs().max():.6f}, nan={torch.isnan(hs).sum()}")
+                logger.info(f"  turn_logits: mean={outputs['turn_logits'].mean():.6f}, std={outputs['turn_logits'].std():.6f}")
+                logger.info(f"  loss: {loss.item():.6f}")
+                logger.info(f"  turn_labels: {batch['turn_labels'].tolist()}")
+                # 检查 td_head 权重
+                td_weight = model.td_head.token_class_head.weight
+                logger.info(f"  td_head weight: mean={td_weight.mean():.6f}, std={td_weight.std():.6f}, nan={torch.isnan(td_weight).sum()}")
+                # 检查梯度
+                if td_weight.grad is not None:
+                    grad = td_weight.grad
+                    logger.info(f"  td_head grad: mean={grad.mean():.6f}, std={grad.std():.6f}, nan={torch.isnan(grad).sum()}, max={grad.abs().max():.6f}")
+                else:
+                    logger.info(f"  td_head grad: None (梯度累积中)")
+                logger.info(f"--- End Debug ---\n")
+
+            # NaN 检测
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.warning(f"⚠️ NaN/Inf loss detected at step {batch_idx}, skipping this batch")
+                optimizer.zero_grad()
+                continue
+
             # Backward
             if args.deepspeed:
                 model_engine.backward(loss)
@@ -577,11 +670,25 @@ def train(args):
             else:
                 loss.backward()
                 if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(
+                    # 梯度裁剪前检查梯度
+                    total_norm = torch.nn.utils.clip_grad_norm_(
                         [p for group in optimizer_grouped_parameters for p in group["params"]],
                         1.0
                     )
+                    if torch.isnan(total_norm) or torch.isinf(total_norm):
+                        logger.warning(f"⚠️ NaN/Inf gradient norm detected, skipping optimizer step")
+                        optimizer.zero_grad()
+                        continue
+                    # 检查权重更新前的状态
+                    if batch_idx < 10:
+                        td_weight = model.td_head.token_class_head.weight
+                        logger.info(f"  Before optimizer.step(): weight mean={td_weight.mean():.6f}, nan={torch.isnan(td_weight).sum()}")
                     optimizer.step()
+                    scheduler.step()  # 更新学习率
+                    # 检查权重更新后的状态
+                    if batch_idx < 10:
+                        td_weight = model.td_head.token_class_head.weight
+                        logger.info(f"  After optimizer.step(): weight mean={td_weight.mean():.6f}, nan={torch.isnan(td_weight).sum()}")
                     optimizer.zero_grad()
 
             # 收集预测
@@ -610,7 +717,8 @@ def train(args):
                 # 详细日志 - 每 logging_steps 步输出
                 if global_step % args.logging_steps == 0 and is_rank0:
                     metrics = compute_metrics(all_labels, all_preds)
-                    logger.info(f"Step {global_step} | Loss: {loss.item():.4f} | Acc: {metrics['acc']:.4f} | F1: {metrics['macro_f1']:.4f}")
+                    current_lr = scheduler.get_last_lr()[0]
+                    logger.info(f"Step {global_step} | Loss: {loss.item():.4f} | Acc: {metrics['acc']:.4f} | F1: {metrics['macro_f1']:.4f} | LR: {current_lr:.6f}")
                     all_preds = []
                     all_labels = []
 
@@ -648,6 +756,7 @@ def train(args):
                         test_f1 = eval_metrics['macro_f1']
                         if test_f1 > best_metric:
                             best_metric = test_f1
+                            best_metrics = eval_metrics.copy()  # 保存最优模型的详细指标
                             patience_counter = 0
                             best_path = os.path.join(args.output_dir, "best_checkpoint")
                             os.makedirs(best_path, exist_ok=True)
@@ -801,15 +910,23 @@ python train/train.py \\
 TD Head: {args.td_head_type} (ffn={args.ffn_type})
 LoRA: {'启用' if args.use_lora else '禁用'} (rank={args.lora_rank}, alpha={args.lora_alpha})
 加载权重: {args.load_td_head or '无'}
+初始化策略: {getattr(args, 'init_strategy', 'N/A')}
+缩放系数: {getattr(args, 'init_scale', 'N/A')}
 
 {'='*60}
-最优结果
+最优结果 (Best Checkpoint)
 {'='*60}
 Best Testset Macro-F1: {best_metric:.4f}
 Best Checkpoint: {best_checkpoint_path or '无'}
 
+各类别详细指标:
+  Complete:     Acc={best_metrics['per_class_acc'][0]:.4f} | P={best_metrics['per_class_precision'][0]:.4f} | R={best_metrics['per_class_recall'][0]:.4f} | F1={best_metrics['per_class_f1'][0]:.4f}
+  InComplete:   Acc={best_metrics['per_class_acc'][1]:.4f} | P={best_metrics['per_class_precision'][1]:.4f} | R={best_metrics['per_class_recall'][1]:.4f} | F1={best_metrics['per_class_f1'][1]:.4f}
+  Backchannel:  Acc={best_metrics['per_class_acc'][2]:.4f} | P={best_metrics['per_class_precision'][2]:.4f} | R={best_metrics['per_class_recall'][2]:.4f} | F1={best_metrics['per_class_f1'][2]:.4f}
+  Wait:         Acc={best_metrics['per_class_acc'][3]:.4f} | P={best_metrics['per_class_precision'][3]:.4f} | R={best_metrics['per_class_recall'][3]:.4f} | F1={best_metrics['per_class_f1'][3]:.4f}
+
 {'='*60}
-最终模型
+最终模型 (Final)
 {'='*60}
 Final Model: {final_path}
 Final Accuracy: {final_metrics['acc']:.4f}
@@ -842,12 +959,16 @@ def main():
     parser.add_argument("--sampler", type=str, default="weighted",
                         choices=["none", "weighted", "balanced"])
     parser.add_argument("--stage", type=str, default="A", choices=["A", "B", "C"])
-    parser.add_argument("--td_head_type", type=str, default="attention", choices=["attention", "mlp", "qwen"],
+    parser.add_argument("--td_head_type", type=str, default="attention", choices=["attention", "mlp", "qwen", "token"],
                         help="TD Head type: attention (AttentionPooling), mlp (2-layer MLP), or qwen (GQA+FFN Decoder)")
     parser.add_argument("--ffn_type", type=str, default="moe", choices=["moe", "dense"],
                         help="FFN type for qwen head: moe (128 experts, top-8) or dense (SwiGLU 6144)")
     parser.add_argument("--num_td_layers", type=int, default=1,
                         help="Number of decoder layers in qwen classifier head")
+    parser.add_argument("--init_strategy", type=str, default="column", choices=["row", "column", "projection"],
+                        help="Initialization strategy for token head: row, column, or projection")
+    parser.add_argument("--init_scale", type=float, default=0.2,
+                        help="Scale factor for initialization weights")
     parser.add_argument("--use_lora", action="store_true")
     parser.add_argument("--lora_rank", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
